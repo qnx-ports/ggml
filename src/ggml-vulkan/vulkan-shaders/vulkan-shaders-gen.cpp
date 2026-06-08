@@ -322,7 +322,7 @@ compile_count_guard acquire_compile_slot() {
     // succeeds but glslc exits without writing its .spv file, silently omitting shader
     // variants.  N=4 still produced ~10% intermittent failures; N=1 is required at the
     // default limit.  This guard can be removed once the target image is built with a
-    // sufficiently high -f value (e.g. procnto-smp-instr -f 65536) and that setting has
+    // sufficiently high -f value (e.g. procnto-smp-instr -f 32768) and that setting has
     // been validated to eliminate the failures.
 #if defined(__QNX__)
     uint32_t N = 1u;
