@@ -2155,6 +2155,19 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
 
+    // RAII guard: always decrement compile_count and signal the condvar on
+    // scope exit, even when an exception unwinds the stack.
+    struct CompileCountGuard {
+        ~CompileCountGuard() {
+            {
+                std::lock_guard<std::mutex> g(compile_count_mutex);
+                assert(compile_count > 0);
+                compile_count--;
+            }
+            compile_count_cond.notify_all();
+        }
+    } compile_count_guard;
+
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
 
     // Patch SPIR-V to enable RTE rounding for FP16, avoiding the need for
@@ -2348,12 +2361,6 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 
     device->all_pipelines.push_back(pipeline);
 
-    {
-        std::lock_guard<std::mutex> guard(compile_count_mutex);
-        assert(compile_count > 0);
-        compile_count--;
-    }
-    compile_count_cond.notify_all();
 }
 
 static void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline) {
