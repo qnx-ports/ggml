@@ -382,14 +382,53 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
         // }
         // std::cout << std::endl;
 
-        execute_command(cmd, stdout_str, stderr_str);
+        // glslc on QNX intermittently exits 0 with empty stderr and no output file.
+        // The failure is not deterministic: the same command succeeds on a subsequent
+        // attempt. Retry up to 3 times before treating empty output as fatal.
+        // Exceptions thrown here propagate through the std::future; c.get() below
+        // makes any persistent failure stop the build with a visible error.
+        std::string spv;
+#ifdef __QNX__
+        constexpr int max_attempts = 3;
+#else
+        constexpr int max_attempts = 1;
+#endif
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            stdout_str.clear();
+            stderr_str.clear();
+            execute_command(cmd, stdout_str, stderr_str);
+            if (!stderr_str.empty()) {
+                break;
+            }
+            spv = read_binary_file(out_path, true);
+            if (!spv.empty()) {
+                break;
+            }
+#ifdef __QNX__
+            if (attempt != max_attempts) {
+                std::cerr << "glslc produced empty output for " << name << ", retrying" << std::endl;
+            }
+#endif
+        }
         if (!stderr_str.empty()) {
             std::cerr << "cannot compile " << name << "\n\n";
             for (const auto& part : cmd) {
                 std::cerr << part << " ";
             }
             std::cerr << "\n\n" << stderr_str << std::endl;
-            return;
+            // The original `return` abandoned the promise silently; c.wait() at the
+            // call site then completed normally as if compilation succeeded, producing
+            // a broken install with no diagnostic. throw stores the error in the
+            // std::future so c.get() below can surface it as a fatal build failure.
+            throw std::runtime_error("glslc failed for " + name);
+        }
+
+        if (spv.empty()) {
+            // glslc's silent failure mode on QNX: exit 0, no stderr, no output file.
+            // Invisible to the stderr-only check above; without this a missing shader
+            // produces a broken package with no error message. Same future propagation
+            // as above; c.get() makes it a fatal build failure.
+            throw std::runtime_error("glslc did not produce shader output for " + name + ": " + out_path);
         }
 
         if (dep_file) {
@@ -408,6 +447,10 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
         shader_fnames.push_back(std::make_pair(name, out_path));
     } catch (const std::exception& e) {
         std::cerr << "Error executing command for " << name << ": " << e.what() << std::endl;
+        // Log then re-throw. This catch exists to print the error; without re-throw
+        // it absorbs the exception entirely, the future completes as if nothing failed,
+        // and c.get() below sees a successful result despite the broken shader output.
+        throw;
     }
 }
 
@@ -1017,7 +1060,11 @@ void process_shaders() {
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
     for (auto &c : compiles) {
-        c.wait();
+        // c.wait() only blocks until completion and discards any stored exception;
+        // c.get() re-throws it. Using c.wait() here would silently swallow every
+        // throw from string_to_spv_func regardless of what failed, and the build
+        // would continue producing a broken package with no error.
+        c.get();
     }
 }
 
