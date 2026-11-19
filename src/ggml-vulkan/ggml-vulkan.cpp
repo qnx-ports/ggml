@@ -2381,6 +2381,28 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
 
+    // If anything below throws (e.g. vkCreateComputePipelines returning
+    // VK_ERROR_INITIALIZATION_FAILED), release the claim taken in
+    // ggml_vk_load_shaders and wake the waiters. Otherwise compile_pending
+    // stays true and compiled stays false, so every thread waiting on
+    // compile_cv for this pipeline, and every later request for it, blocks
+    // forever. The normal path below clears compile_pending itself.
+    struct compile_claim_guard {
+        vk_device & device;
+        vk_pipeline & pipeline;
+        bool done = false;
+        ~compile_claim_guard() {
+            if (done) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> guard(device->compile_mutex);
+                pipeline->compile_pending = false;
+            }
+            device->compile_cv.notify_all();
+        }
+    } claim_guard { device, pipeline };
+
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
 
     // Patch SPIR-V to enable RTE rounding for FP16, avoiding the need for
@@ -2589,6 +2611,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         pipeline->compiled = true;
         pipeline->compile_pending = false;
     }
+    claim_guard.done = true;
     device->compile_cv.notify_all();
 }
 
@@ -5473,9 +5496,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Another thread may be compiling the pipeline we need; block on it here.
     if (wait_pipeline) {
         std::unique_lock<std::mutex> wait_lock(device->compile_mutex);
+        // Also stop waiting if the compiling thread gave up its claim without
+        // finishing: its compile threw, see compile_claim_guard.
         device->compile_cv.wait(wait_lock, [&] {
-            return wait_pipeline->compiled.load();
+            return wait_pipeline->compiled.load() || !wait_pipeline->compile_pending;
         });
+        if (!wait_pipeline->compiled) {
+            GGML_ABORT("ggml_vulkan: compiling pipeline %s failed", wait_pipeline->name.c_str());
+        }
     }
 }
 
