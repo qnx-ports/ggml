@@ -401,7 +401,7 @@ if (GGML_CPU_ALL_VARIANTS)
             ggml_add_cpu_backend_variant(sapphirerapids SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 AMX_TILE AMX_INT8)
         endif()
     elseif(GGML_SYSTEM_ARCH STREQUAL "ARM")
-        if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+        if (CMAKE_SYSTEM_NAME MATCHES "Linux|QNX")
             # Many of these features are optional so we build versions with popular
             # combinations and name the backends based on the version they were
             # first released with

@@ -932,9 +932,24 @@ struct vk_device_struct {
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
+    // Compute buffer cache: keep the largest recently freed large compute buffer
+    // alive instead of calling vkFreeMemory.  On NVK/TTM, vkFreeMemory does not
+    // immediately return physical pages; they linger in a TTM eviction queue.  If
+    // multiple large buffers are freed back-to-back the queue grows until a new
+    // large allocation fails with ErrorOutOfDeviceMemory.  Holding the largest
+    // freed buffer avoids ever growing the TTM queue past one entry.
+    static constexpr size_t COMPUTE_BUF_CACHE_MIN = 256ULL * 1024 * 1024;
+    vk_buffer   compute_buf_cache;
+    size_t      compute_buf_cache_size = 0;
+    std::mutex  compute_buf_cache_mutex;
+
     ~vk_device_struct() {
         VK_LOG_DEBUG("destroy device " << name);
 
+
+        // Drop cached compute buffer before tearing down device-level objects.
+        compute_buf_cache.reset();
+        compute_buf_cache_size = 0;
         device.destroyFence(fence);
 
         ggml_vk_destroy_buffer(sync_staging);
@@ -983,6 +998,7 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+    vk_buffer parent_buffer;  // non-null = sub-alloc; VkDeviceMemory owned by parent
 
     ~vk_buffer_struct() {
         if (size == 0) {
@@ -990,7 +1006,9 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
-        device->device.freeMemory(device_memory);
+        if (!parent_buffer) {
+            device->device.freeMemory(device_memory);
+        }
         device->device.destroyBuffer(buffer);
     }
 };
@@ -2088,6 +2106,7 @@ struct ggml_backend_vk_buffer_context {
     vk_device_ref device;
     vk_buffer dev_buffer;
     std::string name;
+    ggml_backend_vk_context * scratch_owner_ctx = nullptr;
 
     ggml_backend_vk_buffer_context(vk_device_ref device, vk_buffer&& dev_buffer, std::string& name) :
         device(device),
@@ -2096,6 +2115,23 @@ struct ggml_backend_vk_buffer_context {
     }
 
     ~ggml_backend_vk_buffer_context() {
+        if (scratch_owner_ctx) {
+            // Only release sub-buffers that were carved from this compute buffer's
+            // VkDeviceMemory. Standalone buffers (parent_buffer == nullptr) were
+            // allocated by ggml_vk_preallocate_buffers and must persist for caching
+            // — nullifying them here would cause a 512 MiB/render VRAM leak.
+            scratch_owner_ctx->prealloc_y_last_tensor_used   = nullptr;
+            scratch_owner_ctx->prealloc_y_last_pipeline_used = nullptr;
+            auto nullify_child = [&](vk_buffer& buf) {
+                if (buf && buf->parent_buffer == dev_buffer) {
+                    buf = nullptr;
+                }
+            };
+            nullify_child(scratch_owner_ctx->prealloc_y);
+            nullify_child(scratch_owner_ctx->prealloc_x);
+            nullify_child(scratch_owner_ctx->prealloc_split_k);
+            nullify_child(scratch_owner_ctx->prealloc_add_rms_partials);
+        }
         ggml_vk_destroy_buffer(dev_buffer);
     }
 };
@@ -2345,6 +2381,28 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
 
+    // If anything below throws (e.g. vkCreateComputePipelines returning
+    // VK_ERROR_INITIALIZATION_FAILED), release the claim taken in
+    // ggml_vk_load_shaders and wake the waiters. Otherwise compile_pending
+    // stays true and compiled stays false, so every thread waiting on
+    // compile_cv for this pipeline, and every later request for it, blocks
+    // forever. The normal path below clears compile_pending itself.
+    struct compile_claim_guard {
+        vk_device & device;
+        vk_pipeline & pipeline;
+        bool done = false;
+        ~compile_claim_guard() {
+            if (done) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> guard(device->compile_mutex);
+                pipeline->compile_pending = false;
+            }
+            device->compile_cv.notify_all();
+        }
+    } claim_guard { device, pipeline };
+
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
 
     // Patch SPIR-V to enable RTE rounding for FP16, avoiding the need for
@@ -2553,6 +2611,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         pipeline->compiled = true;
         pipeline->compile_pending = false;
     }
+    claim_guard.done = true;
     device->compile_cv.notify_all();
 }
 
@@ -3055,7 +3114,7 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
         return;
     }
 
-    if (buf->device != nullptr) {
+    if (buf->device != nullptr && !buf->parent_buffer) {
         buf->device->memory_logger->log_deallocation(buf);
     }
 
@@ -3064,6 +3123,52 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
 
 static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buffer& buf, size_t offset = 0) {
     return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
+}
+
+// Thread-local hint populated by ggml_backend_vk_set_scratch_workspace_hint()
+// and consumed by ggml_backend_vk_buffer_type_alloc_buffer().
+namespace {
+struct VkScratchHint {
+    ggml_backend_vk_context * ctx = nullptr;
+    vk_device                 device;
+    uint64_t size_y       = 0;
+    uint64_t size_x       = 0;
+    uint64_t size_split_k = 0;
+    uint64_t size_add_rms = 0;
+};
+thread_local VkScratchHint g_vk_scratch_hint;
+} // namespace
+
+// Create a VkBuffer bound into an existing parent buffer's VkDeviceMemory.
+// The offset is rounded up to the buffer's VkMemoryRequirements.alignment.
+static vk_buffer ggml_vk_create_subbuffer(vk_buffer& parent, size_t offset, size_t size) {
+    vk_device& device = parent->device;
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                                  vk::BufferUsageFlagBits::eTransferSrc  |
+                                  vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address)
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+
+    vk::Buffer sub_vk = device->device.createBuffer(
+        {{}, size, usage, vk::SharingMode::eExclusive});
+
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(sub_vk);
+    size_t aligned = (offset + mem_req.alignment - 1) & ~(mem_req.alignment - 1);
+    device->device.bindBufferMemory(sub_vk, parent->device_memory, aligned);
+
+    auto sub = std::make_shared<vk_buffer_struct>();
+    sub->buffer                = sub_vk;
+    sub->device_memory         = parent->device_memory;
+    sub->memory_property_flags = parent->memory_property_flags;
+    sub->ptr    = parent->ptr ? static_cast<char *>(parent->ptr) + aligned : nullptr;
+    sub->size   = size;
+    sub->device = device;
+    sub->parent_buffer = parent;
+    if (device->buffer_device_address) {
+        const vk::BufferDeviceAddressInfo ai(sub_vk);
+        sub->bda_addr = device->device.getBufferAddress(ai);
+    }
+    return sub;
 }
 
 static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
@@ -5391,9 +5496,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Another thread may be compiling the pipeline we need; block on it here.
     if (wait_pipeline) {
         std::unique_lock<std::mutex> wait_lock(device->compile_mutex);
+        // Also stop waiting if the compiling thread gave up its claim without
+        // finishing: its compile threw, see compile_claim_guard.
         device->compile_cv.wait(wait_lock, [&] {
-            return wait_pipeline->compiled.load();
+            return wait_pipeline->compiled.load() || !wait_pipeline->compile_pending;
         });
+        if (!wait_pipeline->compiled) {
+            GGML_ABORT("ggml_vulkan: compiling pipeline %s failed", wait_pipeline->name.c_str());
+        }
     }
 }
 
@@ -6154,6 +6264,24 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->mul_mat_id_s_int[i] = device->mul_mat_id_s[i];
         }
 
+        // The vendor table above sets mul_mat flags for all types including
+        // GGML_TYPE_BF16 without consulting device->bf16.  Override here so
+        // pipeline creation is never attempted on hardware that lacks the
+        // VK_KHR_shader_bfloat16 extension.
+        if (!device->bf16) {
+            device->mul_mat_l[GGML_TYPE_BF16]        = false;
+            device->mul_mat_m[GGML_TYPE_BF16]        = false;
+            device->mul_mat_s[GGML_TYPE_BF16]        = false;
+            device->mul_mat_id_l[GGML_TYPE_BF16]     = false;
+            device->mul_mat_id_m[GGML_TYPE_BF16]     = false;
+            device->mul_mat_id_s[GGML_TYPE_BF16]     = false;
+            device->mul_mat_l_int[GGML_TYPE_BF16]    = false;
+            device->mul_mat_m_int[GGML_TYPE_BF16]    = false;
+            device->mul_mat_s_int[GGML_TYPE_BF16]    = false;
+            device->mul_mat_id_l_int[GGML_TYPE_BF16] = false;
+            device->mul_mat_id_m_int[GGML_TYPE_BF16] = false;
+            device->mul_mat_id_s_int[GGML_TYPE_BF16] = false;
+        }
 
         std::vector<vk::DescriptorSetLayoutBinding> dsl_binding;
         std::vector<vk::DescriptorBindingFlags> dsl_binding_flags;
@@ -6472,6 +6600,7 @@ static void ggml_vk_instance_init() {
     if (debug_utils_ext) {
         extensions.push_back("VK_EXT_debug_utils");
     }
+#if VK_HEADER_VERSION >= 301
     VkBool32 enable_best_practice = layer_settings;
     std::vector<vk::LayerSettingEXT> settings = {
         {
@@ -6484,6 +6613,9 @@ static void ggml_vk_instance_init() {
     };
     vk::LayerSettingsCreateInfoEXT layer_setting_info(settings);
     vk::InstanceCreateInfo instance_create_info(vk::InstanceCreateFlags{}, &app_info, layers, extensions, &layer_setting_info);
+#else
+    vk::InstanceCreateInfo instance_create_info(vk::InstanceCreateFlags{}, &app_info, layers, extensions);
+#endif
 #ifdef __APPLE__
     if (portability_enumeration_ext) {
         instance_create_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
@@ -14420,6 +14552,31 @@ static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
 static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+
+    if (ctx->dev_buffer && ctx->dev_buffer->size >= vk_device_struct::COMPUTE_BUF_CACHE_MIN) {
+        vk_device dev = ctx->device.lock();
+        if (dev) {
+            std::lock_guard<std::mutex> lock(dev->compute_buf_cache_mutex);
+            if (ctx->dev_buffer->size > dev->compute_buf_cache_size) {
+                // This buffer is larger than the cached one: evict the old entry
+                // and cache this one.  Log the deallocation so ggml totals stay
+                // balanced, but do NOT reset the shared_ptr so vkFreeMemory is
+                // never called and NVK TTM never queues this BO for eviction.
+                if (dev->compute_buf_cache) {
+                    // Reset directly (not via ggml_vk_destroy_buffer) to avoid
+                    // calling log_deallocation on a handle already removed from
+                    // the allocations map when this buffer was first cached.
+                    dev->compute_buf_cache.reset();
+                }
+                dev->memory_logger->log_deallocation(ctx->dev_buffer);
+                dev->compute_buf_cache      = std::move(ctx->dev_buffer);
+                dev->compute_buf_cache_size = dev->compute_buf_cache->size;
+                delete ctx;
+                return;
+            }
+        }
+    }
+
     ggml_vk_destroy_buffer(ctx->dev_buffer);
     delete ctx;
 }
@@ -14557,15 +14714,91 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
 
-    vk_buffer dev_buffer = nullptr;
-    try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
-    } catch (const vk::SystemError& e) {
-        return nullptr;
+    // Consume any pending scratch hint for this device.
+    VkScratchHint hint;
+    if (g_vk_scratch_hint.ctx && g_vk_scratch_hint.device == ctx->device) {
+        hint = g_vk_scratch_hint;
+        g_vk_scratch_hint = {};
     }
 
-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+    // Align compute region end; add per-scratch padding to cover bindBufferMemory
+    // alignment requirements (worst-case = device alignment, conservatively padded).
+    const size_t kAlign = std::max(
+        (size_t)ctx->device->properties.limits.minStorageBufferOffsetAlignment,
+        (size_t)256u);
+    const size_t compute_end = (size + kAlign - 1) & ~(kAlign - 1);
+    size_t total = compute_end;
+    if (hint.ctx) {
+        total += hint.size_y      + kAlign;
+        total += hint.size_x      + kAlign;
+        total += hint.size_split_k + kAlign;
+        total += hint.size_add_rms + kAlign;
+    }
 
+    // Safety cap: if the scratch hint would inflate a small compute buffer
+    // (<64 MiB logical) beyond 1 GiB total, the hint is almost certainly
+    // stale -- set for UNet/VAE but not consumed before a small CLIP alloc.
+    // Drop it so the operation falls back to standalone preallocate_buffers.
+    static constexpr size_t SCRATCH_STALE_TOTAL_LIMIT  = 1024ULL * 1024 * 1024;
+    static constexpr size_t SCRATCH_STALE_LOGICAL_MAX  =   64ULL * 1024 * 1024;
+    if (hint.ctx && total > SCRATCH_STALE_TOTAL_LIMIT && compute_end < SCRATCH_STALE_LOGICAL_MAX) {
+        total    = compute_end;
+        hint.ctx = nullptr;
+    }
+
+    vk_buffer dev_buffer = nullptr;
+
+    if (total >= vk_device_struct::COMPUTE_BUF_CACHE_MIN) {
+        std::lock_guard<std::mutex> lock(ctx->device->compute_buf_cache_mutex);
+        if (ctx->device->compute_buf_cache && ctx->device->compute_buf_cache_size >= total) {
+            // Re-use the cached VkDeviceMemory.  Log the re-allocation so ggml
+            // totals stay balanced with the earlier deferred log_deallocation.
+            dev_buffer = std::move(ctx->device->compute_buf_cache);
+            ctx->device->compute_buf_cache_size = 0;
+            ctx->device->memory_logger->log_allocation(dev_buffer, dev_buffer->size);
+        }
+    }
+
+    if (!dev_buffer) {
+        try {
+            dev_buffer = ggml_vk_create_buffer_device(ctx->device, total);
+        } catch (const vk::SystemError& e) {
+            return nullptr;
+        }
+    }
+
+    ggml_backend_vk_buffer_context * bufctx =
+        new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+
+    if (hint.ctx) {
+        ggml_backend_vk_context * bknd = hint.ctx;
+        size_t off = compute_end;
+        if (hint.size_y > 0) {
+            bknd->prealloc_y      = ggml_vk_create_subbuffer(bufctx->dev_buffer, off, hint.size_y);
+            bknd->prealloc_size_y = hint.size_y;
+            off += hint.size_y;
+            off  = (off + kAlign - 1) & ~(kAlign - 1);
+        }
+        if (hint.size_x > 0) {
+            bknd->prealloc_x      = ggml_vk_create_subbuffer(bufctx->dev_buffer, off, hint.size_x);
+            bknd->prealloc_size_x = hint.size_x;
+            off += hint.size_x;
+            off  = (off + kAlign - 1) & ~(kAlign - 1);
+        }
+        if (hint.size_split_k > 0) {
+            bknd->prealloc_split_k      = ggml_vk_create_subbuffer(bufctx->dev_buffer, off, hint.size_split_k);
+            bknd->prealloc_size_split_k = hint.size_split_k;
+            off += hint.size_split_k;
+            off  = (off + kAlign - 1) & ~(kAlign - 1);
+        }
+        if (hint.size_add_rms > 0) {
+            bknd->prealloc_add_rms_partials      = ggml_vk_create_subbuffer(bufctx->dev_buffer, off, hint.size_add_rms);
+            bknd->prealloc_size_add_rms_partials = hint.size_add_rms;
+        }
+        bufctx->scratch_owner_ctx = bknd;
+    }
+
+    // Report only the compute region size to gallocr; scratch is hidden overhead.
     return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
 }
 
@@ -16234,6 +16467,55 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
 bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
+}
+
+void ggml_backend_vk_set_scratch_workspace_hint(ggml_backend_t backend,
+                                                 const ggml_cgraph * cgraph) {
+    if (!ggml_backend_is_vk(backend) || !cgraph) {
+        return;
+    }
+    ggml_backend_vk_context * ctx =
+        (ggml_backend_vk_context *) backend->context;
+
+    uint64_t max_y = 0, max_x = 0, max_split_k = 0;
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!node || ggml_is_empty(node)) continue;
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) continue;
+
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        if (!src0 || !src1) continue;
+
+        const int64_t ne00 = src0->ne[0];
+        const int64_t ne01 = src0->ne[1];
+        const int64_t ne10 = src1->ne[0];
+        const int64_t ne11 = src1->ne[1];
+
+        // y: src1 converted/dequantised to f16
+        const uint64_t y_sz = (uint64_t)ne10 * ne11 * sizeof(ggml_fp16_t);
+        if (y_sz > max_y) max_y = y_sz;
+
+        // x: src0 dequantised to f16 (quantised weights only)
+        if (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) {
+            const uint64_t x_sz =
+                (uint64_t)ggml_type_size(GGML_TYPE_F16) * ne00 * ne01 /
+                ggml_blck_size(GGML_TYPE_F16);
+            if (x_sz > max_x) max_x = x_sz;
+        }
+
+        // split_k scratch: output tile × up-to-8 split in f32 (conservative bound)
+        const uint64_t sk_sz = (uint64_t)ne01 * ne11 * sizeof(float) * 8;
+        if (sk_sz > max_split_k) max_split_k = sk_sz;
+    }
+
+    // add_rms_partials stays at its initialised size (1024 B) for SD models.
+    const uint64_t add_rms_sz = ctx->prealloc_size_add_rms_partials
+                                 ? ctx->prealloc_size_add_rms_partials
+                                 : 1024;
+
+    g_vk_scratch_hint = {ctx, ctx->device, max_y, max_x, max_split_k, add_rms_sz};
 }
 
 int ggml_backend_vk_get_device_count() {

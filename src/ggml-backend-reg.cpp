@@ -10,6 +10,8 @@
 #include <type_traits>
 #include <vector>
 #include <cctype>
+#include <climits>
+#include <cstdio>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -435,6 +437,27 @@ static fs::path get_executable_path() {
         path.resize(path.size() * 2);
     }
 
+    return base_path + "/";
+#elif defined(__QNX__)
+    // QNX has no /proc/self/exe symlink; /proc/self/exefile is a regular
+    // file that contains the executable's path.
+    std::string base_path = ".";
+    FILE * f = fopen("/proc/self/exefile", "r");
+    if (f) {
+        char path[PATH_MAX];
+        size_t len = fread(path, 1, sizeof(path) - 1, f);
+        fclose(f);
+        while (len > 0 && (path[len - 1] == '\n' || path[len - 1] == '\0')) {
+            len--;
+        }
+        if (len > 0) {
+            base_path = std::string(path, len);
+            auto last_slash = base_path.find_last_of('/');
+            if (last_slash != std::string::npos) {
+                base_path = base_path.substr(0, last_slash);
+            }
+        }
+    }
     return base_path + "/";
 #elif defined(_WIN32)
     std::vector<wchar_t> path(MAX_PATH);
