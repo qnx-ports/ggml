@@ -6,6 +6,54 @@
 #include <sys/auxv.h>
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
+#elif defined(__QNX__)
+#include <setjmp.h>
+#include <signal.h>
+
+// QNX has no getauxval()/HWCAP, and reading the ID_AA64*_EL1 registers from
+// EL0 raises SIGILL (Linux emulates those reads; QNX does not). Probe each
+// feature by executing one instruction that needs it and catching SIGILL.
+// The assembler encodes each instruction, enabled per function with a target
+// attribute, so the probes do not depend on hand-written opcodes. This runs
+// once, when the backend variant is scored at load time.
+static sigjmp_buf ggml_qnx_probe_jmp;
+
+static void ggml_qnx_probe_sigill(int) {
+    siglongjmp(ggml_qnx_probe_jmp, 1);
+}
+
+static bool ggml_qnx_probe(void (*insn)(void)) {
+    struct sigaction sa = {};
+    struct sigaction old = {};
+    sa.sa_handler = ggml_qnx_probe_sigill;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGILL, &sa, &old) != 0) {
+        return false;
+    }
+    bool ok = false;
+    if (sigsetjmp(ggml_qnx_probe_jmp, 1) == 0) {
+        insn();
+        ok = true;
+    }
+    sigaction(SIGILL, &old, nullptr);
+    return ok;
+}
+
+__attribute__((target("+dotprod"))) static void ggml_qnx_probe_dotprod(void) {
+    __asm__ volatile("sdot v0.4s, v1.16b, v2.16b" ::: "v0");
+}
+__attribute__((target("+fp16"))) static void ggml_qnx_probe_fp16(void) {
+    __asm__ volatile("fadd v0.8h, v1.8h, v2.8h" ::: "v0");
+}
+__attribute__((target("+i8mm"))) static void ggml_qnx_probe_i8mm(void) {
+    __asm__ volatile("smmla v0.4s, v1.16b, v2.16b" ::: "v0");
+}
+__attribute__((target("+sve"))) static void ggml_qnx_probe_sve(void) {
+    __asm__ volatile("orr z0.d, z1.d, z2.d" ::: "z0");
+}
+__attribute__((target("+sve2"))) static void ggml_qnx_probe_sve2(void) {
+    __asm__ volatile("eor3 z0.d, z0.d, z1.d, z2.d" ::: "z0");
+}
 #endif
 
 #if !defined(HWCAP2_SVE2)
@@ -57,6 +105,14 @@ struct aarch64_features {
         }
 
         // Apple apparently does not implement SVE yet
+#elif defined(__QNX__)
+        has_dotprod = ggml_qnx_probe(ggml_qnx_probe_dotprod);
+        has_fp16_va = ggml_qnx_probe(ggml_qnx_probe_fp16);
+        has_i8mm    = ggml_qnx_probe(ggml_qnx_probe_i8mm);
+        has_sve     = ggml_qnx_probe(ggml_qnx_probe_sve);
+        has_sve2    = has_sve && ggml_qnx_probe(ggml_qnx_probe_sve2);
+        // SME is left off: probing it means entering streaming mode, and no
+        // QNX target with SME is available to test against.
 #endif
     }
 };
